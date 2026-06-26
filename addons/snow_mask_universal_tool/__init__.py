@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Universal Snow Mask Tool",
     "author": "OpenAI Codex",
-    "version": (1, 1, 0),
+    "version": (1, 1, 1),
     "blender": (5, 1, 0),
     "location": "View3D > Sidebar > Snow Mask",
     "description": "Import FBX, apply an adjustable snow mask material, and sync controls across submeshes.",
@@ -840,7 +840,64 @@ def import_ascii_fbx_lightweight(path):
 
 
 
-def bake_top_projection_mask(target_objects=None, normal_z_min=0.0):
+def polygon_sample_points(obj, poly, inset=0.08):
+    center = obj.matrix_world @ poly.center
+    points = [center]
+    world_vertices = [obj.matrix_world @ obj.data.vertices[index].co for index in poly.vertices]
+    for point in world_vertices:
+        points.append(center.lerp(point, max(0.0, min(1.0, 1.0 - inset))))
+    for index, point in enumerate(world_vertices):
+        next_point = world_vertices[(index + 1) % len(world_vertices)]
+        midpoint = (point + next_point) * 0.5
+        points.append(center.lerp(midpoint, max(0.0, min(1.0, 1.0 - inset))))
+    return points
+
+
+def ray_hits_face_from_top(depsgraph, obj, poly, point, origin_z, min_z, self_tolerance):
+    origin = mathutils.Vector((point.x, point.y, origin_z))
+    hit, location, _normal, face_index, hit_obj, _matrix = bpy.context.scene.ray_cast(
+        depsgraph, origin, mathutils.Vector((0.0, 0.0, -1.0)), distance=(origin_z - min_z + 20.0)
+    )
+    if not hit:
+        return False
+    if hit_obj == obj and face_index == poly.index:
+        return True
+    if hit_obj == obj:
+        hit_poly = obj.data.polygons[face_index] if 0 <= face_index < len(obj.data.polygons) else None
+        if hit_poly:
+            target_z = (obj.matrix_world @ poly.center).z
+            hit_z = location.z
+            same_height = abs(hit_z - target_z) <= self_tolerance
+            same_normal = (obj.matrix_world.to_3x3() @ hit_poly.normal).normalized().z >= 0.0
+            if same_height and same_normal:
+                return True
+    return False
+
+
+def dilate_face_attribute(mesh, attr, steps):
+    if steps <= 0:
+        return
+    edge_to_faces = {}
+    for poly in mesh.polygons:
+        for edge_key in poly.edge_keys:
+            edge_to_faces.setdefault(tuple(sorted(edge_key)), []).append(poly.index)
+    neighbors = {poly.index: set() for poly in mesh.polygons}
+    for face_indices in edge_to_faces.values():
+        if len(face_indices) < 2:
+            continue
+        for face_index in face_indices:
+            neighbors[face_index].update(other for other in face_indices if other != face_index)
+    marked = {index for index, item in enumerate(attr.data) if item.value > 0.5}
+    for _step in range(steps):
+        expanded = set(marked)
+        for face_index in marked:
+            expanded.update(neighbors.get(face_index, ()))
+        marked = expanded
+    for index in marked:
+        attr.data[index].value = 1.0
+
+
+def bake_top_projection_mask(target_objects=None, normal_z_min=0.0, sample_inset=0.08, self_tolerance=0.35, dilate_steps=1):
     depsgraph = bpy.context.evaluated_depsgraph_get()
     meshes = [obj for obj in (target_objects or bpy.context.scene.objects) if obj.type == "MESH"]
     if not meshes:
@@ -860,19 +917,22 @@ def bake_top_projection_mask(target_objects=None, normal_z_min=0.0):
             item.value = 0.0
         for poly in mesh.polygons:
             total += 1
-            world_center = obj.matrix_world @ poly.center
             world_normal = (obj.matrix_world.to_3x3() @ poly.normal).normalized()
             if world_normal.z < normal_z_min:
                 continue
-            origin = mathutils.Vector((world_center.x, world_center.y, origin_z))
-            hit, _loc, _normal, face_index, hit_obj, _matrix = bpy.context.scene.ray_cast(
-                depsgraph, origin, mathutils.Vector((0.0, 0.0, -1.0)), distance=(origin_z - min_z + 20.0)
-            )
-            if hit and hit_obj == obj and face_index == poly.index:
-                attr.data[poly.index].value = 1.0
-                marked += 1
+            for point in polygon_sample_points(obj, poly, sample_inset):
+                if ray_hits_face_from_top(depsgraph, obj, poly, point, origin_z, min_z, self_tolerance):
+                    attr.data[poly.index].value = 1.0
+                    marked += 1
+                    break
+        dilate_face_attribute(mesh, attr, dilate_steps)
         mesh.update()
-    return marked, total
+    marked_after = 0
+    for obj in meshes:
+        attr = obj.data.attributes.get(TOP_PROJECTION_ATTRIBUTE)
+        if attr:
+            marked_after += sum(1 for item in attr.data if item.value > 0.5)
+    return marked_after, total
 
 
 def import_fbx(path):
@@ -1042,11 +1102,14 @@ class SNOWMASK_OT_bake_top_projection(bpy.types.Operator):
     bl_options = {"REGISTER", "UNDO"}
 
     selected_only: bpy.props.BoolProperty(name="Selected Only", default=False)
-    normal_z_min: bpy.props.FloatProperty(name="Normal Z Min", default=0.0, min=-1.0, max=1.0)
+    normal_z_min: bpy.props.FloatProperty(name="Normal Z Min", default=-0.05, min=-1.0, max=1.0)
+    sample_inset: bpy.props.FloatProperty(name="Sample Inset", default=0.08, min=0.0, max=0.45)
+    self_tolerance: bpy.props.FloatProperty(name="Self Tolerance", default=0.35, min=0.0, max=10.0)
+    dilate_steps: bpy.props.IntProperty(name="Dilate Steps", default=1, min=0, max=8)
 
     def execute(self, context):
         objects = context.selected_objects if self.selected_only else None
-        marked, total = bake_top_projection_mask(objects, self.normal_z_min)
+        marked, total = bake_top_projection_mask(objects, self.normal_z_min, self.sample_inset, self.self_tolerance, self.dilate_steps)
         ensure_all_top_projection_nodes()
         set_all_top_projection_enabled(True)
         set_all_top_projection_weight(context.scene.snowmask_top_projection_weight)
