@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Universal Snow Mask Tool",
     "author": "OpenAI Codex",
-    "version": (1, 0, 6),
+    "version": (1, 1, 0),
     "blender": (5, 1, 0),
     "location": "View3D > Sidebar > Snow Mask",
     "description": "Import FBX, apply an adjustable snow mask material, and sync controls across submeshes.",
@@ -286,6 +286,8 @@ def create_snow_mix_material(original_mat, shared_name=None):
     else:
         set_input(bsdf, ["Metallic"], 0.0)
         set_input(bsdf, ["Roughness"], SNOW_ROUGHNESS)
+    ensure_normal_noise_blend_node_group()
+    ensure_top_projection_nodes(mat)
     return mat
 
 
@@ -341,11 +343,17 @@ def connect_debug_mask_output(mat, debug_value):
     if not snow or not mask_to_color:
         return False
     output_name = DEBUG_VIEW_OUTPUTS.get(int(debug_value), "Final Mask")
-    if output_name not in snow.outputs or "Fac" not in mask_to_color.inputs:
+    if "Fac" not in mask_to_color.inputs:
+        return False
+    if int(debug_value) == 0 and TOP_PROJECTION_FINAL_MAX_NODE in tree.nodes:
+        source_socket = tree.nodes[TOP_PROJECTION_FINAL_MAX_NODE].outputs["Value"]
+    elif output_name in snow.outputs:
+        source_socket = snow.outputs[output_name]
+    else:
         return False
     for link in list(mask_to_color.inputs["Fac"].links):
         tree.links.remove(link)
-    tree.links.new(snow.outputs[output_name], mask_to_color.inputs["Fac"])
+    tree.links.new(source_socket, mask_to_color.inputs["Fac"])
     return True
 
 
@@ -363,6 +371,191 @@ def set_all_debug_view(debug_value):
 SHOW_ORIGINAL_NODE = "SHOW_ORIGINAL_TEXTURE"
 DEBUG_MASK_COLOR_NODE = "Debug Mask To Color"
 PREVIEW_SWITCH_NODE = "Preview Original Or Debug Mask"
+TOP_PROJECTION_ATTRIBUTE = "SnowTopProjectionMask"
+TOP_PROJECTION_ATTR_NODE = "Top Projection Mask Attribute"
+TOP_PROJECTION_ENABLE_NODE = "TOP_PROJECTION_ENABLE"
+TOP_PROJECTION_WEIGHT_NODE = "TOP_PROJECTION_WEIGHT"
+TOP_PROJECTION_ENABLE_MATH_NODE = "Top Projection x Enable"
+TOP_PROJECTION_WEIGHT_MATH_NODE = "Top Projection x Weight"
+TOP_PROJECTION_FINAL_MAX_NODE = "Final Mask With Top Projection"
+NORMAL_NOISE_BLEND_SOCKET = "Normal Noise Blend 0 Clean 1 Noisy"
+
+
+
+def get_group_input_node(node_group):
+    for node in node_group.nodes:
+        if node.bl_idname == "NodeGroupInput":
+            return node
+    return None
+
+
+def add_group_float_input(node_group, name, default=0.0, min_value=0.0, max_value=1.0):
+    if name not in [item.name for item in node_group.interface.items_tree]:
+        socket_item = node_group.interface.new_socket(name=name, in_out="INPUT", socket_type="NodeSocketFloat")
+        for attr, value in (("default_value", default), ("min_value", min_value), ("max_value", max_value)):
+            try:
+                setattr(socket_item, attr, value)
+            except Exception:
+                pass
+    group_input = get_group_input_node(node_group)
+    if group_input and name in group_input.outputs:
+        try:
+            group_input.outputs[name].default_value = default
+        except Exception:
+            pass
+        return group_input.outputs[name]
+    return None
+
+
+def ensure_normal_noise_blend_node_group():
+    node_group = bpy.data.node_groups.get(SNOW_GROUP_NAME)
+    if not node_group:
+        return False
+    blend_socket = add_group_float_input(node_group, NORMAL_NOISE_BLEND_SOCKET, 1.0, 0.0, 1.0)
+    group_input = get_group_input_node(node_group)
+    clean_node = node_group.nodes.get("Normal Up Smooth Mask")
+    noisy_node = node_group.nodes.get("Normal Mask + Noise")
+    normal_enable = node_group.nodes.get("Normal Enable")
+    if not group_input or not blend_socket or not clean_node or not noisy_node or not normal_enable:
+        return False
+    nodes = node_group.nodes
+    links = node_group.links
+
+    inv = nodes.get("Normal Noise Blend 1 - Factor") or nodes.new("ShaderNodeMath")
+    inv.name = "Normal Noise Blend 1 - Factor"
+    inv.operation = "SUBTRACT"
+    inv.location = (-555, 505)
+    inv.inputs[0].default_value = 1.0
+
+    clean_mul = nodes.get("Normal Clean x BlendInv") or nodes.new("ShaderNodeMath")
+    clean_mul.name = "Normal Clean x BlendInv"
+    clean_mul.operation = "MULTIPLY"
+    clean_mul.location = (-360, 420)
+
+    noisy_mul = nodes.get("Normal Noisy x Blend") or nodes.new("ShaderNodeMath")
+    noisy_mul.name = "Normal Noisy x Blend"
+    noisy_mul.operation = "MULTIPLY"
+    noisy_mul.location = (-360, 300)
+
+    lerp = nodes.get("Normal Clean Noisy Lerp") or nodes.new("ShaderNodeMath")
+    lerp.name = "Normal Clean Noisy Lerp"
+    lerp.operation = "ADD"
+    lerp.location = (-170, 420)
+
+    def reconnect(from_socket, to_socket):
+        for link in list(to_socket.links):
+            links.remove(link)
+        links.new(from_socket, to_socket)
+
+    reconnect(blend_socket, inv.inputs[1])
+    reconnect(clean_node.outputs["Result"], clean_mul.inputs[0])
+    reconnect(inv.outputs["Value"], clean_mul.inputs[1])
+    reconnect(noisy_node.outputs["Value"], noisy_mul.inputs[0])
+    reconnect(blend_socket, noisy_mul.inputs[1])
+    reconnect(clean_mul.outputs["Value"], lerp.inputs[0])
+    reconnect(noisy_mul.outputs["Value"], lerp.inputs[1])
+    reconnect(lerp.outputs["Value"], normal_enable.inputs[0])
+    return True
+
+
+def set_all_normal_noise_blend(value):
+    ensure_normal_noise_blend_node_group()
+    count = 0
+    for _mat, node in snow_control_nodes():
+        if NORMAL_NOISE_BLEND_SOCKET in node.inputs:
+            node.inputs[NORMAL_NOISE_BLEND_SOCKET].default_value = float(value)
+            count += 1
+    return count
+
+
+def ensure_top_projection_nodes(mat):
+    if not mat or not mat.node_tree:
+        return False
+    tree = mat.node_tree
+    nodes = tree.nodes
+    links = tree.links
+    snow = nodes.get(CONTROL_NODE_NAME)
+    if not snow or "Final Mask" not in snow.outputs:
+        return False
+
+    attr = nodes.get(TOP_PROJECTION_ATTR_NODE) or nodes.new("ShaderNodeAttribute")
+    attr.name = TOP_PROJECTION_ATTR_NODE
+    attr.label = "Top Projection Mask Attribute"
+    attr.attribute_name = TOP_PROJECTION_ATTRIBUTE
+    attr.location = (-120, 780)
+
+    enable = nodes.get(TOP_PROJECTION_ENABLE_NODE) or nodes.new("ShaderNodeValue")
+    enable.name = TOP_PROJECTION_ENABLE_NODE
+    enable.label = "Top Projection Enable"
+    enable.location = (-120, 640)
+
+    weight = nodes.get(TOP_PROJECTION_WEIGHT_NODE) or nodes.new("ShaderNodeValue")
+    weight.name = TOP_PROJECTION_WEIGHT_NODE
+    weight.label = "Top Projection Weight"
+    if weight.outputs[0].default_value == 0.0:
+        weight.outputs[0].default_value = 1.0
+    weight.location = (-120, 560)
+
+    enabled_mul = nodes.get(TOP_PROJECTION_ENABLE_MATH_NODE) or nodes.new("ShaderNodeMath")
+    enabled_mul.name = TOP_PROJECTION_ENABLE_MATH_NODE
+    enabled_mul.operation = "MULTIPLY"
+    enabled_mul.location = (80, 740)
+
+    weighted_mul = nodes.get(TOP_PROJECTION_WEIGHT_MATH_NODE) or nodes.new("ShaderNodeMath")
+    weighted_mul.name = TOP_PROJECTION_WEIGHT_MATH_NODE
+    weighted_mul.operation = "MULTIPLY"
+    weighted_mul.location = (260, 740)
+
+    final_max = nodes.get(TOP_PROJECTION_FINAL_MAX_NODE) or nodes.new("ShaderNodeMath")
+    final_max.name = TOP_PROJECTION_FINAL_MAX_NODE
+    final_max.label = "Final Mask With Top Projection"
+    final_max.operation = "MAXIMUM"
+    final_max.location = (430, 740)
+
+    def connect_single(from_socket, to_socket):
+        if len(to_socket.links) == 1 and to_socket.links[0].from_socket == from_socket:
+            return
+        for link in list(to_socket.links):
+            links.remove(link)
+        links.new(from_socket, to_socket)
+
+    connect_single(snow.outputs["Final Mask"], final_max.inputs[0])
+    connect_single(attr.outputs["Fac"], enabled_mul.inputs[0])
+    connect_single(enable.outputs[0], enabled_mul.inputs[1])
+    connect_single(enabled_mul.outputs["Value"], weighted_mul.inputs[0])
+    connect_single(weight.outputs[0], weighted_mul.inputs[1])
+    connect_single(weighted_mul.outputs["Value"], final_max.inputs[1])
+
+    final_socket = snow.outputs["Final Mask"]
+    for link in list(final_socket.links):
+        if link.to_node == final_max:
+            continue
+        to_socket = link.to_socket
+        links.remove(link)
+        links.new(final_max.outputs["Value"], to_socket)
+    return True
+
+
+def ensure_all_top_projection_nodes():
+    return sum(1 for mat, _node in snow_control_nodes() if ensure_top_projection_nodes(mat))
+
+
+def set_all_top_projection_enabled(enabled):
+    count = 0
+    for mat, _node in snow_control_nodes():
+        if ensure_top_projection_nodes(mat):
+            mat.node_tree.nodes[TOP_PROJECTION_ENABLE_NODE].outputs[0].default_value = 1.0 if enabled else 0.0
+            count += 1
+    return count
+
+
+def set_all_top_projection_weight(weight):
+    count = 0
+    for mat, _node in snow_control_nodes():
+        if ensure_top_projection_nodes(mat):
+            mat.node_tree.nodes[TOP_PROJECTION_WEIGHT_NODE].outputs[0].default_value = float(weight)
+            count += 1
+    return count
 
 
 def ensure_preview_switch(mat):
@@ -375,6 +568,7 @@ def ensure_preview_switch(mat):
     bsdf = find_principled(mat)
     if not snow or not bsdf or "Final Mask" not in snow.outputs:
         return False
+    ensure_top_projection_nodes(mat)
 
     show_original = nodes.get(SHOW_ORIGINAL_NODE)
     if not show_original:
@@ -645,6 +839,42 @@ def import_ascii_fbx_lightweight(path):
     return imported
 
 
+
+def bake_top_projection_mask(target_objects=None, normal_z_min=0.0):
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    meshes = [obj for obj in (target_objects or bpy.context.scene.objects) if obj.type == "MESH"]
+    if not meshes:
+        return 0, 0
+    min_z = min((obj.matrix_world @ mathutils.Vector(corner)).z for obj in meshes for corner in obj.bound_box)
+    max_z = max((obj.matrix_world @ mathutils.Vector(corner)).z for obj in meshes for corner in obj.bound_box)
+    height = max(max_z - min_z, 1.0)
+    origin_z = max_z + height + 10.0
+    marked = 0
+    total = 0
+    for obj in meshes:
+        mesh = obj.data
+        attr = mesh.attributes.get(TOP_PROJECTION_ATTRIBUTE)
+        if attr is None:
+            attr = mesh.attributes.new(TOP_PROJECTION_ATTRIBUTE, "FLOAT", "FACE")
+        for item in attr.data:
+            item.value = 0.0
+        for poly in mesh.polygons:
+            total += 1
+            world_center = obj.matrix_world @ poly.center
+            world_normal = (obj.matrix_world.to_3x3() @ poly.normal).normalized()
+            if world_normal.z < normal_z_min:
+                continue
+            origin = mathutils.Vector((world_center.x, world_center.y, origin_z))
+            hit, _loc, _normal, face_index, hit_obj, _matrix = bpy.context.scene.ray_cast(
+                depsgraph, origin, mathutils.Vector((0.0, 0.0, -1.0)), distance=(origin_z - min_z + 20.0)
+            )
+            if hit and hit_obj == obj and face_index == poly.index:
+                attr.data[poly.index].value = 1.0
+                marked += 1
+        mesh.update()
+    return marked, total
+
+
 def import_fbx(path):
     path = Path(path)
     if is_ascii_fbx(path):
@@ -792,6 +1022,62 @@ class SNOWMASK_OT_set_show_original(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class SNOWMASK_OT_set_normal_noise_blend(bpy.types.Operator):
+    bl_idname = "snowmask.set_normal_noise_blend"
+    bl_label = "Set Normal Noise Blend"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        count = set_all_normal_noise_blend(context.scene.snowmask_normal_noise_blend)
+        if count == 0:
+            self.report({"WARNING"}, "No Normal Noise Blend inputs found; materials may need upgrade.")
+        else:
+            self.report({"INFO"}, f"Set Normal Noise Blend on {count} material(s).")
+        return {"FINISHED"}
+
+
+class SNOWMASK_OT_bake_top_projection(bpy.types.Operator):
+    bl_idname = "snowmask.bake_top_projection"
+    bl_label = "Bake Top Projection Mask"
+    bl_options = {"REGISTER", "UNDO"}
+
+    selected_only: bpy.props.BoolProperty(name="Selected Only", default=False)
+    normal_z_min: bpy.props.FloatProperty(name="Normal Z Min", default=0.0, min=-1.0, max=1.0)
+
+    def execute(self, context):
+        objects = context.selected_objects if self.selected_only else None
+        marked, total = bake_top_projection_mask(objects, self.normal_z_min)
+        ensure_all_top_projection_nodes()
+        set_all_top_projection_enabled(True)
+        set_all_top_projection_weight(context.scene.snowmask_top_projection_weight)
+        self.report({"INFO"}, f"Baked top projection mask: {marked}/{total} faces marked.")
+        return {"FINISHED"}
+
+
+class SNOWMASK_OT_set_top_projection_enabled(bpy.types.Operator):
+    bl_idname = "snowmask.set_top_projection_enabled"
+    bl_label = "Set Top Projection Enabled"
+    bl_options = {"REGISTER", "UNDO"}
+
+    enabled: bpy.props.BoolProperty(name="Enabled", default=True)
+
+    def execute(self, context):
+        count = set_all_top_projection_enabled(self.enabled)
+        self.report({"INFO"}, f"Top Projection {'enabled' if self.enabled else 'disabled'} on {count} material(s).")
+        return {"FINISHED"}
+
+
+class SNOWMASK_OT_set_top_projection_weight(bpy.types.Operator):
+    bl_idname = "snowmask.set_top_projection_weight"
+    bl_label = "Set Top Projection Weight"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        count = set_all_top_projection_weight(context.scene.snowmask_top_projection_weight)
+        self.report({"INFO"}, f"Set Top Projection Weight on {count} material(s).")
+        return {"FINISHED"}
+
+
 class SNOWMASK_OT_setup_preview(bpy.types.Operator):
     bl_idname = "snowmask.setup_preview"
     bl_label = "Setup Snow Preview Lighting"
@@ -817,6 +1103,20 @@ class SNOWMASK_PT_panel(bpy.types.Panel):
         layout.prop(context.scene, "snowmask_template_material", text="Template")
         layout.operator("snowmask.sync_from_selected", icon="COPYDOWN")
         layout.operator("snowmask.sync_from_active", icon="PASTEDOWN")
+        layout.separator()
+        layout.label(text="Normal Mask")
+        layout.prop(context.scene, "snowmask_normal_noise_blend", text="Noise Blend")
+        layout.operator("snowmask.set_normal_noise_blend", text="Apply Normal Noise Blend")
+        layout.separator()
+        layout.label(text="Top Projection")
+        row = layout.row(align=True)
+        row.operator("snowmask.bake_top_projection", text="Bake")
+        op = row.operator("snowmask.set_top_projection_enabled", text="On")
+        op.enabled = True
+        op = row.operator("snowmask.set_top_projection_enabled", text="Off")
+        op.enabled = False
+        layout.prop(context.scene, "snowmask_top_projection_weight", text="Weight")
+        layout.operator("snowmask.set_top_projection_weight", text="Apply Top Projection Weight")
         layout.separator()
         layout.label(text="Global Debug View")
         row = layout.row(align=True)
@@ -848,6 +1148,10 @@ CLASSES = (
     SNOWMASK_OT_sync_from_selected,
     SNOWMASK_OT_set_debug_view,
     SNOWMASK_OT_set_show_original,
+    SNOWMASK_OT_set_normal_noise_blend,
+    SNOWMASK_OT_bake_top_projection,
+    SNOWMASK_OT_set_top_projection_enabled,
+    SNOWMASK_OT_set_top_projection_weight,
     SNOWMASK_OT_setup_preview,
     SNOWMASK_PT_panel,
 )
@@ -861,11 +1165,29 @@ def register():
         description="Material whose SNOW_MASK_CONTROLS values will be copied to all other snow materials",
         items=snow_material_items,
     )
+    bpy.types.Scene.snowmask_normal_noise_blend = bpy.props.FloatProperty(
+        name="Normal Noise Blend",
+        description="0 = clean top-facing normal mask, 1 = noisy normal mask",
+        default=1.0,
+        min=0.0,
+        max=1.0,
+    )
+    bpy.types.Scene.snowmask_top_projection_weight = bpy.props.FloatProperty(
+        name="Top Projection Weight",
+        description="Strength for the baked top-projection coverage mask",
+        default=1.0,
+        min=0.0,
+        max=1.0,
+    )
 
 
 def unregister():
     if hasattr(bpy.types.Scene, "snowmask_template_material"):
         del bpy.types.Scene.snowmask_template_material
+    if hasattr(bpy.types.Scene, "snowmask_normal_noise_blend"):
+        del bpy.types.Scene.snowmask_normal_noise_blend
+    if hasattr(bpy.types.Scene, "snowmask_top_projection_weight"):
+        del bpy.types.Scene.snowmask_top_projection_weight
     for cls in reversed(CLASSES):
         try:
             bpy.utils.unregister_class(cls)
