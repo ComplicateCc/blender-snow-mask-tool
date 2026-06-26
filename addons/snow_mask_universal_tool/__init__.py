@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Universal Snow Mask Tool",
     "author": "OpenAI Codex",
-    "version": (1, 1, 1),
+    "version": (1, 2, 0),
     "blender": (5, 1, 0),
     "location": "View3D > Sidebar > Snow Mask",
     "description": "Import FBX, apply an adjustable snow mask material, and sync controls across submeshes.",
@@ -325,12 +325,14 @@ DEBUG_VIEW_LABELS = {
     1: "Normal Mask",
     2: "Corner Mask",
     3: "Ground Mask",
+    4: "Top Projection Mask",
 }
 DEBUG_VIEW_OUTPUTS = {
     0: "Final Mask",
     1: "Normal Up Mask",
     2: "Corner Height Mask",
     3: "Ground Bottom Mask",
+    4: "Top Projection Mask",
 }
 
 
@@ -347,6 +349,8 @@ def connect_debug_mask_output(mat, debug_value):
         return False
     if int(debug_value) == 0 and TOP_PROJECTION_FINAL_MAX_NODE in tree.nodes:
         source_socket = tree.nodes[TOP_PROJECTION_FINAL_MAX_NODE].outputs["Value"]
+    elif int(debug_value) == 4 and TOP_PROJECTION_WEIGHT_MATH_NODE in tree.nodes:
+        source_socket = tree.nodes[TOP_PROJECTION_WEIGHT_MATH_NODE].outputs["Value"]
     elif output_name in snow.outputs:
         source_socket = snow.outputs[output_name]
     else:
@@ -1052,7 +1056,7 @@ class SNOWMASK_OT_set_debug_view(bpy.types.Operator):
     bl_label = "Set Snow Debug View"
     bl_options = {"REGISTER", "UNDO"}
 
-    debug_value: bpy.props.IntProperty(name="Debug View", default=0, min=0, max=3)
+    debug_value: bpy.props.IntProperty(name="Debug View", default=0, min=0, max=4)
 
     def execute(self, context):
         ensure_all_preview_switches()
@@ -1151,6 +1155,78 @@ class SNOWMASK_OT_setup_preview(bpy.types.Operator):
         return {"FINISHED"}
 
 
+LANGUAGE_ITEMS = (
+    ("ZH", "中文", "中文界面"),
+    ("EN", "English", "English UI"),
+)
+
+UI_TEXT = {
+    "ZH": {
+        "import_apply": "导入 FBX 并应用覆雪",
+        "create_independent": "为当前材质创建独立覆雪材质",
+        "template": "模板材质",
+        "sync_template": "从模板同步覆雪参数",
+        "sync_active": "从当前材质同步覆雪参数",
+        "normal_mask": "法线顶面积雪",
+        "noise_blend": "Noise 混合",
+        "apply_normal_blend": "应用 Normal Noise 混合",
+        "top_projection": "顶部投影覆雪",
+        "bake": "烘焙",
+        "on": "开启",
+        "off": "关闭",
+        "weight": "强度",
+        "apply_top_weight": "应用投影强度",
+        "debug": "全局 Debug 视图",
+        "final": "最终",
+        "normal": "法线",
+        "corner": "角落",
+        "ground": "底部",
+        "top": "投影",
+        "preview": "预览模式",
+        "original_snow": "原贴图+覆雪",
+        "mask_only": "只看 Mask",
+        "setup_preview": "设置预览灯光/相机",
+        "hint_textures": "每个 submesh 保留自己的贴图。",
+        "hint_params": "同步只会复制覆雪参数。",
+        "language": "语言",
+    },
+    "EN": {
+        "import_apply": "Import FBX And Apply Snow",
+        "create_independent": "Create Independent Snow Materials",
+        "template": "Template",
+        "sync_template": "Sync From Template Material",
+        "sync_active": "Sync From Active Material",
+        "normal_mask": "Normal Mask",
+        "noise_blend": "Noise Blend",
+        "apply_normal_blend": "Apply Normal Noise Blend",
+        "top_projection": "Top Projection",
+        "bake": "Bake",
+        "on": "On",
+        "off": "Off",
+        "weight": "Weight",
+        "apply_top_weight": "Apply Top Projection Weight",
+        "debug": "Global Debug View",
+        "final": "Final",
+        "normal": "Normal",
+        "corner": "Corner",
+        "ground": "Ground",
+        "top": "Top",
+        "preview": "Preview Mode",
+        "original_snow": "Original+Snow",
+        "mask_only": "Mask Only",
+        "setup_preview": "Setup Snow Preview Lighting",
+        "hint_textures": "Each submesh keeps its own textures.",
+        "hint_params": "Only SNOW_MASK_CONTROLS values are synced.",
+        "language": "Language",
+    },
+}
+
+
+def ui_text(context, key):
+    lang = getattr(context.scene, "snowmask_ui_language", "ZH")
+    return UI_TEXT.get(lang, UI_TEXT["ZH"]).get(key, key)
+
+
 class SNOWMASK_PT_panel(bpy.types.Panel):
     bl_label = "Universal Snow Mask Tool"
     bl_idname = "SNOWMASK_PT_panel"
@@ -1160,48 +1236,51 @@ class SNOWMASK_PT_panel(bpy.types.Panel):
 
     def draw(self, context):
         layout = self.layout
-        layout.operator("snowmask.import_apply", icon="IMPORT")
-        layout.operator("snowmask.apply_all", icon="MATERIAL")
+        layout.prop(context.scene, "snowmask_ui_language", text=ui_text(context, "language"))
+        layout.operator("snowmask.import_apply", text=ui_text(context, "import_apply"), icon="IMPORT")
+        layout.operator("snowmask.apply_all", text=ui_text(context, "create_independent"), icon="MATERIAL")
         layout.separator()
-        layout.prop(context.scene, "snowmask_template_material", text="Template")
-        layout.operator("snowmask.sync_from_selected", icon="COPYDOWN")
-        layout.operator("snowmask.sync_from_active", icon="PASTEDOWN")
+        layout.prop(context.scene, "snowmask_template_material", text=ui_text(context, "template"))
+        layout.operator("snowmask.sync_from_selected", text=ui_text(context, "sync_template"), icon="COPYDOWN")
+        layout.operator("snowmask.sync_from_active", text=ui_text(context, "sync_active"), icon="PASTEDOWN")
         layout.separator()
-        layout.label(text="Normal Mask")
-        layout.prop(context.scene, "snowmask_normal_noise_blend", text="Noise Blend")
-        layout.operator("snowmask.set_normal_noise_blend", text="Apply Normal Noise Blend")
+        layout.label(text=ui_text(context, "normal_mask"))
+        layout.prop(context.scene, "snowmask_normal_noise_blend", text=ui_text(context, "noise_blend"))
+        layout.operator("snowmask.set_normal_noise_blend", text=ui_text(context, "apply_normal_blend"))
         layout.separator()
-        layout.label(text="Top Projection")
+        layout.label(text=ui_text(context, "top_projection"))
         row = layout.row(align=True)
-        row.operator("snowmask.bake_top_projection", text="Bake")
-        op = row.operator("snowmask.set_top_projection_enabled", text="On")
+        row.operator("snowmask.bake_top_projection", text=ui_text(context, "bake"))
+        op = row.operator("snowmask.set_top_projection_enabled", text=ui_text(context, "on"))
         op.enabled = True
-        op = row.operator("snowmask.set_top_projection_enabled", text="Off")
+        op = row.operator("snowmask.set_top_projection_enabled", text=ui_text(context, "off"))
         op.enabled = False
-        layout.prop(context.scene, "snowmask_top_projection_weight", text="Weight")
-        layout.operator("snowmask.set_top_projection_weight", text="Apply Top Projection Weight")
+        layout.prop(context.scene, "snowmask_top_projection_weight", text=ui_text(context, "weight"))
+        layout.operator("snowmask.set_top_projection_weight", text=ui_text(context, "apply_top_weight"))
         layout.separator()
-        layout.label(text="Global Debug View")
+        layout.label(text=ui_text(context, "debug"))
         row = layout.row(align=True)
-        op = row.operator("snowmask.set_debug_view", text="Final")
+        op = row.operator("snowmask.set_debug_view", text=ui_text(context, "final"))
         op.debug_value = 0
-        op = row.operator("snowmask.set_debug_view", text="Normal")
+        op = row.operator("snowmask.set_debug_view", text=ui_text(context, "normal"))
         op.debug_value = 1
         row = layout.row(align=True)
-        op = row.operator("snowmask.set_debug_view", text="Corner")
+        op = row.operator("snowmask.set_debug_view", text=ui_text(context, "corner"))
         op.debug_value = 2
-        op = row.operator("snowmask.set_debug_view", text="Ground")
+        op = row.operator("snowmask.set_debug_view", text=ui_text(context, "ground"))
         op.debug_value = 3
-        layout.label(text="Preview Mode")
+        op = row.operator("snowmask.set_debug_view", text=ui_text(context, "top"))
+        op.debug_value = 4
+        layout.label(text=ui_text(context, "preview"))
         row = layout.row(align=True)
-        op = row.operator("snowmask.set_show_original", text="Original+Snow")
+        op = row.operator("snowmask.set_show_original", text=ui_text(context, "original_snow"))
         op.show_original = True
-        op = row.operator("snowmask.set_show_original", text="Mask Only")
+        op = row.operator("snowmask.set_show_original", text=ui_text(context, "mask_only"))
         op.show_original = False
         layout.separator()
-        layout.operator("snowmask.setup_preview", icon="LIGHT")
-        layout.label(text="Each submesh keeps its own textures.")
-        layout.label(text="Only SNOW_MASK_CONTROLS values are synced.")
+        layout.operator("snowmask.setup_preview", text=ui_text(context, "setup_preview"), icon="LIGHT")
+        layout.label(text=ui_text(context, "hint_textures"))
+        layout.label(text=ui_text(context, "hint_params"))
 
 
 CLASSES = (
@@ -1223,6 +1302,12 @@ CLASSES = (
 def register():
     for cls in CLASSES:
         bpy.utils.register_class(cls)
+    bpy.types.Scene.snowmask_ui_language = bpy.props.EnumProperty(
+        name="语言 / Language",
+        description="Snow Mask Tool UI language",
+        items=LANGUAGE_ITEMS,
+        default="ZH",
+    )
     bpy.types.Scene.snowmask_template_material = bpy.props.EnumProperty(
         name="Snow Template Material",
         description="Material whose SNOW_MASK_CONTROLS values will be copied to all other snow materials",
@@ -1245,6 +1330,8 @@ def register():
 
 
 def unregister():
+    if hasattr(bpy.types.Scene, "snowmask_ui_language"):
+        del bpy.types.Scene.snowmask_ui_language
     if hasattr(bpy.types.Scene, "snowmask_template_material"):
         del bpy.types.Scene.snowmask_template_material
     if hasattr(bpy.types.Scene, "snowmask_normal_noise_blend"):
