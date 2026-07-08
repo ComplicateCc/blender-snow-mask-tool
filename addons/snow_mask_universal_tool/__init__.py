@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Universal Snow Mask Tool",
     "author": "OpenAI Codex",
-    "version": (1, 2, 0),
+    "version": (1, 3, 0),
     "blender": (5, 1, 0),
     "location": "View3D > Sidebar > Snow Mask",
     "description": "Import FBX, apply an adjustable snow mask material, and sync controls across submeshes.",
@@ -9,6 +9,8 @@ bl_info = {
 }
 import math
 import re
+import struct
+import xml.etree.ElementTree as ElementTree
 from pathlib import Path
 
 import bpy
@@ -844,6 +846,240 @@ def import_ascii_fbx_lightweight(path):
 
 
 
+
+def parse_neox_xml_readonly(path):
+    raw = Path(path).read_bytes()
+    for encoding in ("utf-8", "gbk", "utf-8-sig"):
+        try:
+            return ElementTree.fromstring(raw.decode(encoding))
+        except Exception:
+            continue
+    return ElementTree.fromstring(raw.decode("utf-8", errors="ignore"))
+
+
+def find_neox_res_root(path):
+    current = Path(path).resolve().parent
+    for parent in (current, *current.parents):
+        if parent.name.lower() == "res":
+            return parent
+    return current
+
+
+def resolve_neox_resource_path(resource_root, gim_dir, value):
+    if not value:
+        return None
+    value = value.replace("/", "\\")
+    candidates = []
+    value_path = Path(value)
+    if value_path.is_absolute():
+        candidates.append(value_path)
+    candidates.append(resource_root / value)
+    candidates.append(gim_dir / value)
+    candidates.append(gim_dir / Path(value).name)
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
+
+def read_gim_submeshes(gim_path):
+    root = parse_neox_xml_readonly(gim_path)
+    submesh_node = root.find("SubMesh")
+    submeshes = []
+    if submesh_node is not None:
+        for child in list(submesh_node):
+            submeshes.append({
+                "name": child.attrib.get("Name", child.tag),
+                "material_index": int(child.attrib.get("MtlIdx", len(submeshes))),
+            })
+    return submeshes
+
+
+def read_mtg_materials(mtg_path, resource_root, gim_dir):
+    root = parse_neox_xml_readonly(mtg_path)
+    material_group = root.find("MaterialGroup")
+    materials = []
+    if material_group is None:
+        return materials
+    for material_slot in list(material_group):
+        material_node = material_slot.find("Material")
+        if material_node is None:
+            continue
+        param_table = material_node.find("ParamTable")
+        params = {}
+        if param_table is not None:
+            for param in list(param_table):
+                params[param.tag] = param.attrib.get("Value", "")
+        materials.append({
+            "name": material_node.attrib.get("Name", material_slot.tag),
+            "diffuse": resolve_neox_resource_path(resource_root, gim_dir, params.get("Tex0")),
+            "normal": resolve_neox_resource_path(resource_root, gim_dir, params.get("NormalMap")),
+            "param": resolve_neox_resource_path(resource_root, gim_dir, params.get("ParamMap")),
+            "params": params,
+        })
+    return materials
+
+
+def read_neox_mesh(mesh_path, submesh_count):
+    data = Path(mesh_path).read_bytes()
+    offset = 0
+
+    def unpack(fmt):
+        nonlocal offset
+        size = struct.calcsize(fmt)
+        values = struct.unpack_from(fmt, data, offset)
+        offset += size
+        return values
+
+    _mark, version, mesh_type = unpack("<IIh")
+    if version < 0x50002:
+        raise RuntimeError(f"Unsupported NeoX mesh version: {hex(version)}")
+    has_morph, = unpack("<?")
+    if has_morph:
+        raise RuntimeError("NeoX morph mesh is not supported by this preview importer.")
+    has_track, = unpack("<?")
+    if has_track:
+        raise RuntimeError("NeoX track mesh is not supported by this preview importer.")
+    if mesh_type == 1:
+        bone_count, = unpack("<h")
+        offset += bone_count + bone_count * 32
+        has_bone_bounding, = unpack("<?")
+        if has_bone_bounding:
+            offset += bone_count * 7 * 4
+        offset += bone_count * 16 * 4
+        has_key_bounding, = unpack("<?")
+        if has_key_bounding:
+            raise RuntimeError("NeoX per-key bounding mesh is not supported by this preview importer.")
+
+    geometry_offset, = unpack("<I")
+    offset = geometry_offset
+    block_count, = unpack("<h")
+    block_offsets = list(unpack("<" + "I" * block_count))
+    pair_count, = unpack("<h")
+    offset += pair_count * 6
+    offset = block_offsets[0]
+
+    sub_infos = []
+    global_has_color = False
+    for _index in range(submesh_count):
+        vertex_count, triangle_count, uv_count, has_color = unpack("<IIb?")
+        sub_infos.append({"vertex_count": vertex_count, "triangle_count": triangle_count, "uv_count": uv_count, "has_color": has_color})
+        global_has_color = global_has_color or has_color
+    for sub_info in sub_infos:
+        sub_info["has_color"] = global_has_color
+
+    _lod_index, total_vertex_count, total_triangle_count = unpack("<hII")
+    positions = [unpack("<fff") for _ in range(total_vertex_count)]
+    normals = [unpack("<fff") for _ in range(total_vertex_count)]
+    has_tangent, = unpack("<h")
+    tangents = [unpack("<fff") for _ in range(total_vertex_count)] if has_tangent else []
+    triangles = [unpack("<HHH") for _ in range(total_triangle_count)]
+    uvs = [[] for _ in range(total_vertex_count)]
+    vertex_offset = 0
+    for sub_info in sub_infos:
+        for _uv_index in range(sub_info["uv_count"]):
+            for sub_vertex_index in range(sub_info["vertex_count"]):
+                u, v = unpack("<ff")
+                uvs[vertex_offset + sub_vertex_index].append((u, v))
+        vertex_offset += sub_info["vertex_count"]
+    colors = [None] * total_vertex_count
+    vertex_offset = 0
+    for sub_info in sub_infos:
+        if sub_info["has_color"]:
+            for sub_vertex_index in range(sub_info["vertex_count"]):
+                b, g, r, a = unpack("<BBBB")
+                colors[vertex_offset + sub_vertex_index] = (r / 255.0, g / 255.0, b / 255.0, a / 255.0)
+        vertex_offset += sub_info["vertex_count"]
+    return {"sub_infos": sub_infos, "positions": positions, "normals": normals, "tangents": tangents, "triangles": triangles, "uvs": uvs, "colors": colors}
+
+
+def make_neox_base_material(material_info):
+    mat = bpy.data.materials.new(material_info.get("name") or "NeoXMaterial")
+    mat.use_nodes = True
+    tree = mat.node_tree
+    bsdf = find_principled(mat)
+    diffuse_path = material_info.get("diffuse")
+    normal_path = material_info.get("normal")
+    param_path = material_info.get("param")
+    if diffuse_path:
+        tex = new_tex_node(tree, "NeoX Tex0 Diffuse", load_image(diffuse_path, "sRGB"), (-650, 220))
+        if tex:
+            tree.links.new(tex.outputs["Color"], bsdf.inputs["Base Color"])
+    if normal_path:
+        tex = new_tex_node(tree, "NeoX NormalMap", load_image(normal_path, "Non-Color"), (-650, -120))
+        if tex:
+            norm = tree.nodes.new("ShaderNodeNormalMap")
+            norm.location = (-350, -120)
+            tree.links.new(tex.outputs["Color"], norm.inputs["Color"])
+            tree.links.new(norm.outputs["Normal"], bsdf.inputs["Normal"])
+    if param_path:
+        tex = new_tex_node(tree, "NeoX ParamMap R=Rough G=Metal A=AO", load_image(param_path, "Non-Color"), (-650, -420))
+        if tex:
+            separate = tree.nodes.new("ShaderNodeSeparateColor")
+            separate.name = "Separate NeoX ParamMap"
+            separate.location = (-360, -420)
+            tree.links.new(tex.outputs["Color"], separate.inputs["Color"])
+            tree.links.new(separate.outputs[0], bsdf.inputs["Roughness"])
+            tree.links.new(separate.outputs[1], bsdf.inputs["Metallic"])
+    return mat
+
+
+def import_gim(path):
+    gim_path = Path(path)
+    gim_dir = gim_path.parent
+    resource_root = find_neox_res_root(gim_path)
+    submeshes = read_gim_submeshes(gim_path)
+    if not submeshes:
+        raise RuntimeError("GIM has no SubMesh entries.")
+    mesh_path = gim_path.with_suffix(".mesh")
+    mtg_path = gim_path.with_suffix(".mtg")
+    mesh_data = read_neox_mesh(mesh_path, len(submeshes))
+    material_infos = read_mtg_materials(mtg_path, resource_root, gim_dir)
+    base_materials = [make_neox_base_material(info) for info in material_infos]
+    imported = []
+    vertex_offset = 0
+    triangle_offset = 0
+    for submesh_index, submesh in enumerate(submeshes):
+        sub_info = mesh_data["sub_infos"][submesh_index]
+        vertex_count = sub_info["vertex_count"]
+        triangle_count = sub_info["triangle_count"]
+        vertices = list(mesh_data["positions"][vertex_offset:vertex_offset + vertex_count])
+        faces = []
+        for tri in mesh_data["triangles"][triangle_offset:triangle_offset + triangle_count]:
+            faces.append(tuple(index - vertex_offset for index in tri))
+        mesh = bpy.data.meshes.new(submesh["name"] + "_Mesh")
+        mesh.from_pydata(vertices, [], faces)
+        mesh.update()
+        obj = bpy.data.objects.new(submesh["name"], mesh)
+        bpy.context.collection.objects.link(obj)
+        mat_index = submesh["material_index"]
+        if 0 <= mat_index < len(base_materials):
+            mesh.materials.append(base_materials[mat_index])
+        for uv_index in range(sub_info["uv_count"]):
+            uv_layer = mesh.uv_layers.new(name=f"UVChannel_{uv_index}")
+            for poly in mesh.polygons:
+                for loop_index in poly.loop_indices:
+                    vertex_index = mesh.loops[loop_index].vertex_index + vertex_offset
+                    if uv_index < len(mesh_data["uvs"][vertex_index]):
+                        uv_layer.data[loop_index].uv = mesh_data["uvs"][vertex_index][uv_index]
+        if mesh.uv_layers:
+            mesh.uv_layers.active = mesh.uv_layers[0]
+        if any(color is not None for color in mesh_data["colors"][vertex_offset:vertex_offset + vertex_count]):
+            color_attr = mesh.color_attributes.new(name="NeoXVertexColor", type="BYTE_COLOR", domain="CORNER")
+            for poly in mesh.polygons:
+                for loop_index in poly.loop_indices:
+                    vertex_index = mesh.loops[loop_index].vertex_index + vertex_offset
+                    color_attr.data[loop_index].color = mesh_data["colors"][vertex_index] or (1, 1, 1, 1)
+        imported.append(obj)
+        vertex_offset += vertex_count
+        triangle_offset += triangle_count
+    bpy.ops.object.select_all(action="DESELECT")
+    for obj in imported:
+        obj.select_set(True)
+    bpy.context.view_layer.objects.active = imported[0]
+    return imported
+
+
 def polygon_sample_points(obj, poly, inset=0.08):
     center = obj.matrix_world @ poly.center
     points = [center]
@@ -939,13 +1175,19 @@ def bake_top_projection_mask(target_objects=None, normal_z_min=0.0, sample_inset
     return marked_after, total
 
 
-def import_fbx(path):
+def import_model(path):
     path = Path(path)
+    if path.suffix.lower() == ".gim":
+        return import_gim(path)
     if is_ascii_fbx(path):
         return import_ascii_fbx_lightweight(path)
     before = set(bpy.context.scene.objects)
     bpy.ops.import_scene.fbx(filepath=str(path))
     return [obj for obj in bpy.context.scene.objects if obj not in before]
+
+
+def import_fbx(path):
+    return import_model(path)
 
 
 def setup_preview_scene():
@@ -993,12 +1235,12 @@ def setup_preview_scene():
 
 class SNOWMASK_OT_import_apply(bpy.types.Operator):
     bl_idname = "snowmask.import_apply"
-    bl_label = "Import FBX And Apply Snow"
+    bl_label = "Import FBX/GIM And Apply Snow"
     bl_options = {"REGISTER", "UNDO"}
     filepath: bpy.props.StringProperty(subtype="FILE_PATH")
 
     def execute(self, context):
-        import_fbx(self.filepath)
+        import_model(self.filepath)
         count = apply_snow_to_all_mesh_materials()
         setup_preview_scene()
         self.report({"INFO"}, f"Imported FBX and created {count} independent snow material(s).")
@@ -1162,7 +1404,7 @@ LANGUAGE_ITEMS = (
 
 UI_TEXT = {
     "ZH": {
-        "import_apply": "导入 FBX 并应用覆雪",
+        "import_apply": "导入 FBX/GIM 并应用覆雪",
         "create_independent": "为当前材质创建独立覆雪材质",
         "template": "模板材质",
         "sync_template": "从模板同步覆雪参数",
@@ -1191,7 +1433,7 @@ UI_TEXT = {
         "language": "语言",
     },
     "EN": {
-        "import_apply": "Import FBX And Apply Snow",
+        "import_apply": "Import FBX/GIM And Apply Snow",
         "create_independent": "Create Independent Snow Materials",
         "template": "Template",
         "sync_template": "Sync From Template Material",
