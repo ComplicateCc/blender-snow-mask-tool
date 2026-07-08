@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Universal Snow Mask Tool",
     "author": "OpenAI Codex",
-    "version": (1, 3, 2),
+    "version": (1, 3, 3),
     "blender": (5, 1, 0),
     "location": "View3D > Sidebar > Snow Mask",
     "description": "Import FBX, apply an adjustable snow mask material, and sync controls across submeshes.",
@@ -849,12 +849,12 @@ def import_ascii_fbx_lightweight(path):
 
 def neox_pos_to_blender(position):
     x, y, z = position
-    return (x, -z, y)
+    return (-x, -z, y)
 
 
 def neox_vec_to_blender(vector):
     x, y, z = vector
-    return (x, -z, y)
+    return (-x, -z, y)
 
 
 def parse_neox_xml_readonly(path):
@@ -1056,7 +1056,8 @@ def import_gim(path):
         vertices = [neox_pos_to_blender(pos) for pos in mesh_data["positions"][vertex_offset:vertex_offset + vertex_count]]
         faces = []
         for tri in mesh_data["triangles"][triangle_offset:triangle_offset + triangle_count]:
-            faces.append(tuple(index - vertex_offset for index in tri))
+            face = tuple(index - vertex_offset for index in tri)
+            faces.append((face[0], face[2], face[1]))
         mesh = bpy.data.meshes.new(submesh["name"] + "_Mesh")
         mesh.from_pydata(vertices, [], faces)
         mesh.update()
