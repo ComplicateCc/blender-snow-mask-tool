@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Universal Snow Mask Tool",
     "author": "OpenAI Codex",
-    "version": (1, 3, 0),
+    "version": (1, 3, 1),
     "blender": (5, 1, 0),
     "location": "View3D > Sidebar > Snow Mask",
     "description": "Import FBX, apply an adjustable snow mask material, and sync controls across submeshes.",
@@ -847,6 +847,16 @@ def import_ascii_fbx_lightweight(path):
 
 
 
+def neox_pos_to_blender(position):
+    x, y, z = position
+    return (x, -z, y)
+
+
+def neox_vec_to_blender(vector):
+    x, y, z = vector
+    return (x, -z, y)
+
+
 def parse_neox_xml_readonly(path):
     raw = Path(path).read_bytes()
     for encoding in ("utf-8", "gbk", "utf-8-sig"):
@@ -1043,13 +1053,18 @@ def import_gim(path):
         sub_info = mesh_data["sub_infos"][submesh_index]
         vertex_count = sub_info["vertex_count"]
         triangle_count = sub_info["triangle_count"]
-        vertices = list(mesh_data["positions"][vertex_offset:vertex_offset + vertex_count])
+        vertices = [neox_pos_to_blender(pos) for pos in mesh_data["positions"][vertex_offset:vertex_offset + vertex_count]]
         faces = []
         for tri in mesh_data["triangles"][triangle_offset:triangle_offset + triangle_count]:
             faces.append(tuple(index - vertex_offset for index in tri))
         mesh = bpy.data.meshes.new(submesh["name"] + "_Mesh")
         mesh.from_pydata(vertices, [], faces)
         mesh.update()
+        try:
+            mesh.normals_split_custom_set_from_vertices([neox_vec_to_blender(n) for n in mesh_data["normals"][vertex_offset:vertex_offset + vertex_count]])
+            mesh.use_auto_smooth = True if hasattr(mesh, "use_auto_smooth") else False
+        except Exception:
+            pass
         obj = bpy.data.objects.new(submesh["name"], mesh)
         bpy.context.collection.objects.link(obj)
         mat_index = submesh["material_index"]
