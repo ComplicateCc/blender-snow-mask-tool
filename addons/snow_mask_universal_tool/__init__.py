@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Universal Snow Mask Tool",
     "author": "OpenAI Codex",
-    "version": (1, 3, 1),
+    "version": (1, 3, 2),
     "blender": (5, 1, 0),
     "location": "View3D > Sidebar > Snow Mask",
     "description": "Import FBX, apply an adjustable snow mask material, and sync controls across submeshes.",
@@ -1076,7 +1076,8 @@ def import_gim(path):
                 for loop_index in poly.loop_indices:
                     vertex_index = mesh.loops[loop_index].vertex_index + vertex_offset
                     if uv_index < len(mesh_data["uvs"][vertex_index]):
-                        uv_layer.data[loop_index].uv = mesh_data["uvs"][vertex_index][uv_index]
+                        u, v = mesh_data["uvs"][vertex_index][uv_index]
+                        uv_layer.data[loop_index].uv = (u, 1.0 - v)
         if mesh.uv_layers:
             mesh.uv_layers.active = mesh.uv_layers[0]
         if any(color is not None for color in mesh_data["colors"][vertex_offset:vertex_offset + vertex_count]):
