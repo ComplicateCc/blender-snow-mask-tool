@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Universal Snow Mask Tool",
     "author": "OpenAI Codex",
-    "version": (1, 3, 3),
+    "version": (1, 3, 4),
     "blender": (5, 1, 0),
     "location": "View3D > Sidebar > Snow Mask",
     "description": "Import FBX, apply an adjustable snow mask material, and sync controls across submeshes.",
@@ -273,7 +273,7 @@ def create_snow_mix_material(original_mat, shared_name=None):
         metal_mix.factor_mode = "UNIFORM"
         metal_mix.location = (120, -440)
         links.new(snow.outputs["Final Mask"], metal_mix.inputs["Factor"])
-        links.new(separate.outputs[0], metal_mix.inputs[2])
+        links.new(separate.outputs[1], metal_mix.inputs[2])
         metal_mix.inputs[3].default_value = SNOW_METALLIC
         links.new(metal_mix.outputs[0], bsdf.inputs["Metallic"])
         rough_mix = nodes.new("ShaderNodeMix")
@@ -282,7 +282,7 @@ def create_snow_mix_material(original_mat, shared_name=None):
         rough_mix.factor_mode = "UNIFORM"
         rough_mix.location = (120, -650)
         links.new(snow.outputs["Final Mask"], rough_mix.inputs["Factor"])
-        links.new(separate.outputs[1], rough_mix.inputs[2])
+        links.new(separate.outputs[0], rough_mix.inputs[2])
         rough_mix.inputs[3].default_value = SNOW_ROUGHNESS
         links.new(rough_mix.outputs[0], bsdf.inputs["Roughness"])
     else:
